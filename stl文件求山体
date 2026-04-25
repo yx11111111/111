@@ -1,0 +1,577 @@
+import numpy as np
+import trimesh
+from trimesh.ray import ray_pyembree
+import matplotlib.pyplot as plt
+from scipy import integrate
+from matplotlib.ticker import PercentFormatter
+import matplotlib
+import math
+import plotly.graph_objects as go
+import pandas as pd
+from tqdm import tqdm
+import os
+import psutil
+import gc
+from matplotlib.ticker import AutoMinorLocator
+matplotlib.use("TkAgg") 
+from libmusic import (
+    initialize_music,
+    muon_transport,
+    muon_transport_batch,
+    rluxgo,
+)
+
+
+def modified_gaisser(E_mu, cos_theta):
+    P1, P2, P3, P4, P5 = 0.102573, -0.068287, 0.958633, 0.0407253, 0.817285
+    cos_theta_star = np.sqrt(
+        (cos_theta**2 + P1**2 + P2*cos_theta**P3 + P4*cos_theta**P5)
+        / (1 + P1**2 + P2 + P4)
+    )
+    E_mu_star = E_mu * (1 + 3.64 / (E_mu * cos_theta_star**1.29))
+    term1 = 1 / (1 + 1.1 * E_mu * cos_theta_star / 115)
+    term2 = 0.054 / (1 + 1.1 * E_mu * cos_theta_star / 850)
+    return 0.14 * (E_mu_star ** (-2.7)) * (term1 + term2)
+
+def energy_theoretical(E):
+    return integrate.quad(lambda ct: modified_gaisser(E, ct), 0.342, 1)[0]
+
+def cos_theoretical(ct):
+    return integrate.quad(lambda E: modified_gaisser(E, ct), 1, 1000)[0]
+
+def generate_muon_samples(num_samples=10000, E_min=1e2, E_max=1e4, theta_bins=1000, E_bins=1000):
+    E_edges = np.linspace(E_min, E_max, E_bins + 1)
+    cos_theta_edges = np.linspace(0.342, 1, theta_bins + 1)
+    E_centers = (E_edges[:-1] + E_edges[1:]) / 2
+    cos_theta_centers = (cos_theta_edges[:-1] + cos_theta_edges[1:]) / 2
+
+    E_grid, theta_grid = np.meshgrid(E_centers, cos_theta_centers, indexing='ij')
+    flux = np.vectorize(modified_gaisser)(E_grid, theta_grid)
+    flux_flat = flux.flatten()  
+
+
+    prob_flat = flux_flat / flux_flat.sum()
+    cum_prob_flat = np.cumsum(prob_flat)
+    u = np.random.rand(num_samples)
+    idx = np.searchsorted(cum_prob_flat, u)
+
+    energies = []
+    cos_thetas = []
+    for i in idx:
+        e_idx = i // theta_bins
+        t_idx = i % theta_bins
+        energies.append(np.random.uniform(E_edges[e_idx], E_edges[e_idx+1]))
+        cos_thetas.append(np.random.uniform(cos_theta_edges[t_idx], cos_theta_edges[t_idx+1]))
+    
+ 
+    return np.array(energies), np.array(cos_thetas)
+
+def _plot_results(mesh, detector_pos, entry_points, rock_lengths):
+    """绘制结果（仅山体路径）"""
+    valid_mask = ~np.isnan(entry_points[:, 0])
+    if not np.any(valid_mask):
+        print("⚠️ 无有效击中，跳过绘图")
+        return
+
+    fig = plt.figure(figsize=(18, 5))
+    
+    # 1. 3D Impact Points
+    ax1 = fig.add_subplot(131, projection='3d')
+    sc = ax1.scatter(entry_points[valid_mask, 0], 
+                     entry_points[valid_mask, 1], 
+                     rock_lengths[valid_mask],
+                     c=rock_lengths[valid_mask], cmap='viridis', s=1)
+    ax1.set_xlabel('X (m)')
+    ax1.set_ylabel('Y (m)')
+    ax1.set_zlabel('Path in Mountain (m)')
+    ax1.set_title('3D Impact Points')
+    fig.colorbar(sc, ax=ax1, shrink=0.5)
+
+    # 2. Top View
+    ax2 = fig.add_subplot(132)
+    sc2 = ax2.scatter(entry_points[valid_mask, 0], 
+                      entry_points[valid_mask, 1], 
+                      c=rock_lengths[valid_mask], cmap='viridis', s=1)
+    ax2.scatter(detector_pos[0], detector_pos[1], color='red', marker='*', s=100, label='Detector')
+    ax2.set_xlabel('X (m)')
+    ax2.set_ylabel('Y (m)')
+    ax2.set_title('Top View (Mountain Only)')
+    ax2.legend()
+    ax2.axis('equal')
+    fig.colorbar(sc2, ax=ax2, shrink=0.5)
+
+    # 3. Path Length Distribution
+    ax3 = fig.add_subplot(133)
+    ax3.hist(rock_lengths[valid_mask], bins=50, color='skyblue', edgecolor='black')
+    mean_val = np.mean(rock_lengths[valid_mask])
+    ax3.axvline(mean_val, color='red', linestyle='--', label=f'Mean = {mean_val:.1f} m')
+    ax3.set_xlabel('Path Length in Mountain (m)')
+    ax3.set_ylabel('Count')
+    ax3.set_title('Mountain Path Length Distribution')
+    ax3.legend()
+
+    plt.tight_layout()
+    plt.savefig('lijiang_kasite.png', dpi=150)
+    print("📊 结果图已保存为 'muon_mountain_only.png'")
+
+
+
+
+# === 启用 Embree（如果安装了 trimesh[embree]）===
+if hasattr(trimesh, 'constants') and hasattr(trimesh.constants, 'use_embree'):
+    trimesh.constants.use_embree = True
+
+
+def run_muon_in_mountain_fast(
+    stl_file,
+    detector_pos,
+    zenith_angles,
+    azimuth_angles,
+    plot=True
+):
+    """
+    高速版：仅计算缪子在山体 STL 内部的路径长度（无 bedrock）
+    - 使用 float32 节省内存
+    - 自动启用 Embree 加速射线求交
+    - 接口与原函数完全一致
+    """
+    # --- 输入校验 ---
+    if not os.path.exists(stl_file):
+        raise FileNotFoundError(f"STL 文件不存在: {stl_file}")
+    
+    detector_pos = np.asarray(detector_pos, dtype=np.float32)  # ← 改为 float32
+    zenith_angles = np.asarray(zenith_angles, dtype=np.float32)
+    azimuth_angles = np.asarray(azimuth_angles, dtype=np.float32)
+
+    if detector_pos.shape != (3,):
+        raise ValueError("detector_pos 必须是 [x, y, z]")
+    if zenith_angles.shape != azimuth_angles.shape:
+        raise ValueError("角度数组形状必须一致")
+
+    n_muons = zenith_angles.size
+    if n_muons == 0:
+        raise ValueError("角度数组不能为空")
+
+    print(f"📍 探测器位置: {detector_pos}")
+    print(f"🎯 使用 {n_muons:,} 条缪子轨迹...")
+
+    # --- 构建射线 ---
+    start_pos = np.tile(detector_pos, (n_muons, 1))
+    sin_theta = np.sin(zenith_angles)
+    directions = np.column_stack((
+        sin_theta * np.cos(azimuth_angles),
+        sin_theta * np.sin(azimuth_angles),
+        np.cos(zenith_angles)
+    ))
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+
+    # --- 加载模型 ---
+    mesh = trimesh.load(stl_file)
+
+    # --- 射线求交（Embree 会自动加速此步骤）---
+    locations, index_ray, _ = mesh.ray.intersects_location(
+        ray_origins=start_pos,
+        ray_directions=directions,
+        multiple_hits=True
+    )
+
+    # --- 初始化结果（float32）---
+    mountain_lengths = np.zeros(n_muons, dtype=np.float32)
+    entry_points = np.full((n_muons, 3), np.nan, dtype=np.float32)
+
+    if len(locations) == 0:
+        print("\n✅ 模拟完成! 无任何交点。")
+        return entry_points, mountain_lengths
+
+    # --- 向量化：计算距离 ---
+    origins_for_hits = start_pos[index_ray]
+    vectors = locations - origins_for_hits
+    distances = np.linalg.norm(vectors, axis=1)
+
+    # --- 排序 ---
+    sort_key = index_ray.astype(np.int64) * (10**12) + distances.astype(np.float64)
+    sort_idx = np.argsort(sort_key, kind='stable')
+    index_ray_sorted = index_ray[sort_idx]
+    distances_sorted = distances[sort_idx]
+    locations_sorted = locations[sort_idx]
+
+    # --- 分组处理 ---
+    unique_rays, first_occurrence = np.unique(index_ray_sorted, return_index=True)
+    split_distances = np.split(distances_sorted, first_occurrence[1:])
+    split_locations = np.split(locations_sorted, first_occurrence[1:])
+
+    # --- 计算每条射线的路径长度 ---
+    for ray_id, dists, locs in zip(unique_rays, split_distances, split_locations):
+        n_hits = len(dists)
+        if n_hits == 0:
+            continue
+
+        total_len = 0.0
+        if n_hits % 2 == 1:  # 起点在内部
+            total_len += dists[0]
+            for k in range(1, n_hits - 1, 2):
+                total_len += dists[k + 1] - dists[k]
+        else:  # 起点在外部
+            for k in range(0, n_hits - 1, 2):
+                total_len += dists[k + 1] - dists[k]
+
+        mountain_lengths[ray_id] = total_len
+        entry_points[ray_id] = locs[0]
+
+    # --- 统计 ---
+    valid_mask = mountain_lengths > 1e-5  # float32 精度稍低，阈值略放宽
+    n_valid = np.count_nonzero(valid_mask)
+    print(f"\n✅ 模拟完成!")
+    print(f"   总射线数: {n_muons:,}")
+    print(f"   击中山体: {n_valid:,} ({100 * n_valid / n_muons:.1f}%)")
+    if n_valid > 0:
+        print(f"   平均山体路径: {np.mean(mountain_lengths[valid_mask]):.2f} m")
+        print(f"   路径范围: [{np.min(mountain_lengths[valid_mask]):.2f}, {np.max(mountain_lengths[valid_mask]):.2f}] m")
+
+    # --- 绘图 ---
+    if plot and n_valid > 0:
+        _plot_results(mesh, detector_pos, entry_points, mountain_lengths)
+
+    return entry_points, mountain_lengths
+
+# ==========================================
+# 使用示例 (注意所有数值单位必须是 cm)
+# ==========================================
+if __name__ == "__main__":
+    rluxgo(42)
+    initialize_music()
+    stl_file = "/home/yangxin/music-python/yangxin1/karst_caves.stl"
+    h = -300  # 山体最高点高度（米）
+    detector_pos = [0.0, 0.0, h]  # 探测器在地下 300 米
+    n = 1000000  # 模拟 100 万条缪子轨迹
+    suoying=100000
+
+    # 生成角度（假设 generate_muon_samples 已定义）
+    emu1, cos_thetas = generate_muon_samples(num_samples=n)
+    the1 = np.arccos(cos_thetas)
+    ph1 = np.random.uniform(0, 2 * np.pi, len(emu1))
+
+    # 运行山体模拟
+    entry_pts, len1 = run_muon_in_mountain_fast(
+    stl_file,
+    detector_pos,
+    the1,
+    ph1,
+    plot=False
+    )
+    # === 计算水平地面 (z=0) 交点 ===
+    ground_z = 0.0  # 👈 关键：定义 ground_z！
+    detector = np.asarray(detector_pos, dtype=float)
+
+    directions = np.column_stack([
+        np.sin(the1) * np.cos(ph1),
+        np.sin(the1) * np.sin(ph1),
+        np.cos(the1)
+    ])
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+
+    dz = ground_z - detector[2]      # = 0 - (-300) = 300.0
+    t = dz / directions[:, 2]        # 射线参数 t
+    ground_entry_points = detector + t[:, None] * directions
+    ground_entry_points[:, 2] = ground_z  # 强制 z=0
+
+    # === 合并入口点 ===
+    final_entry_points = np.copy(entry_pts)
+    is_miss = np.isnan(entry_pts[:, 0])
+    final_entry_points[is_miss] = ground_entry_points[is_miss]
+
+    x = final_entry_points[:, 0]*100
+    y = final_entry_points[:, 1]*100
+    z = final_entry_points[:, 2]*100
+
+    len2 = h/np.cos(the1)  # 从探测器到山顶的距离（如果垂直向上）
+
+    len3 = len1 - len2  # 如果需要加上地基路径
+    len3 = len3*100
+    
+
+    rh0 = 2.6
+    tmu1 = np.zeros(n)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    counts_emu, bins_emu_edges, patches = ax.hist(len3, bins=150, histtype='step', color='blue', linewidth=1.5)
+    plt.show()  
+
+    print(f"before energies: {emu1} GeV")
+    print(f"before angles (deg): {the1}")
+    print(f"before depths: {len3} cm")
+    print(f"before times: {tmu1} s")
+    print(f"before x: {x} cm")
+    print(f"before y: {y} cm")
+    print(f"before z: {z} cm")
+    result = muon_transport_batch(x, y, z, the1, ph1, emu1, len3, rh0, tmu1)
+    print(f"Batch result dtype: {result.dtype}")
+    print(f"Final energies: {result['emu']}")
+    print(f"Final angles (deg): {result['theta'] * 180 / np.pi}")
+    print(f"Final depths: {result['tracklen']} cm")
+    print(f"Final times: {result['tmu']} s")
+    print(f"Final x: {result['x']} cm")
+    print(f"Final y: {result['y']} cm")
+    print(f"Final z: {result['z']} cm")
+    # 1. 定义能量阈值 (单位需与你模拟中的单位一致，通常是 GeV)
+    energy_threshold = 0.1
+
+    # 2. 创建布尔掩码：找出能量 > 0.1 的粒子索引
+    # mask 是一个布尔数组，例如 [True, False, True, ...]
+    mask = result['emu'] > energy_threshold
+
+    # 3. 统计过滤前后的数量
+    original_count = len(result['emu'])
+    filtered_count = np.sum(mask)
+    removed_count = original_count - filtered_count
+
+    # 2. 计算存活率
+    if original_count > 0:
+        survival_rate = filtered_count / original_count
+        survival_rate_percent = survival_rate * 100.0
+        print(f" 过滤统计: 原始 {original_count} 个 -> 保留 {filtered_count} 个 (去除了 {removed_count} 个低能缪子)")
+        print(f"  存活率: {survival_rate:.4f} ({survival_rate_percent:.2f}%)")
+
+    # 4. 【关键步骤】使用掩码批量截取所有相关数组
+    # 只有当 mask 为 True 时，对应的数据才会被保留
+    emu_final = result['emu'][mask]
+    theta_final = result['theta'][mask] * 180 / np.pi
+    phi_final = result['phi'][mask] * 180 / np.pi
+    length_final = result['tracklen'][mask]
+    tmu_final = result['tmu'][mask]
+    x_final = result['x'][mask]
+    y_final = result['y'][mask]
+    z_final = result['z'][mask]
+
+    print(f"Batch result dtype: {result.dtype}")
+    print(f"Final energies: {emu_final}")
+    print(f"Final angles (deg): {theta_final}")
+    print(f"Final len: {length_final} cm")
+    print(f"Final times: {tmu_final} s")
+    print(f"Final x: {x_final} cm")
+    print(f"Final y: {y_final} cm")
+    print(f"Final z: {z_final} cm")
+    emu_final=emu_final[:50000]
+    theta_final=theta_final[:50000]
+    phi_final=phi_final[:50000]
+    length_final=length_final[:50000]
+    tmu_final=tmu_final[:50000]
+    x_final=x_final[:50000]
+    y_final=y_final[:50000]
+    z_final=z_final[:50000]
+
+    np.savez('caves_5万.npz',
+             emu_final=emu_final,
+             theta_final=theta_final,
+             phi_final=phi_final,
+             length_final=length_final,
+             tmu_final=tmu_final,
+             x_final=x_final,
+             y_final=y_final,
+             z_final=z_final)
+    print(f"✅ 数据已保存为 caves_5万.npz (共 {len(emu_final)} 条记录)")
+
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bins_emu = np.linspace(0, 7500, 150)
+    counts_emu, bins_emu_edges, patches = ax.hist(emu_final, bins=bins_emu, histtype='step', color='blue', linewidth=1.5)
+
+    # 对数 Y 轴
+    ax.set_yscale('log')
+
+    # 标题和标签
+    ax.set_title('Muon Energy Distribution', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Energy (GeV)', fontsize=12)
+    ax.set_ylabel('Entries (log scale)', fontsize=12)
+
+    # 计算峰值和中值
+    mode_bin = np.argmax(counts_emu)
+    mode_value = (bins_emu_edges[mode_bin] + bins_emu_edges[mode_bin + 1]) / 2
+    median_value = np.median(emu_final)
+
+    # 添加统计信息框（包含峰值和中值）
+    stats_emu = (f"Entries: {len(emu_final):d}\n"
+                f"Mean: {np.mean(emu_final):.1f} GeV\n"
+                f"Std Dev: {np.std(emu_final):.1f} GeV\n"
+                f"Median: {median_value:.1f} GeV\n"
+                f"Mode: {mode_value:.1f} GeV\n"
+                f"Min: {np.min(emu_final):.1f} GeV\n"
+                f"Max: {np.max(emu_final):.1f} GeV")
+
+    ax.text(0.98, 0.98, stats_emu, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', horizontalalignment='right',
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="black"))
+
+    # 标记峰值
+    ax.axvline(mode_value, color='red', linestyle='--', linewidth=1, alpha=0.7, label=f'Mode: {mode_value:.1f} GeV')
+    ax.axvline(median_value, color='orange', linestyle=':', linewidth=1, alpha=0.7, label=f'Median: {median_value:.1f} GeV')
+
+    # 添加图例
+    ax.legend(loc='upper left', fontsize=9)
+
+    plt.tight_layout()
+    plt.show()
+
+    # ================================
+    # 绘制 phi 直方图（线性Y轴）
+    # ================================
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bins_phi = np.linspace(0, 360, 73)  # 73个边界产生72个bin，更准确
+    counts_phi, bins_phi_edges, patches = ax.hist(phi_final, bins=bins_phi, histtype='step', color='green', linewidth=1.5)
+
+    # 标题和标签
+    ax.set_title('Azimuth Angle (φ) Distribution', fontsize=14, fontweight='bold')
+    ax.set_xlabel('φ (radians)', fontsize=12)
+    ax.set_ylabel('Entries', fontsize=12)
+
+    # 计算峰值和中值
+    mode_bin = np.argmax(counts_phi)
+    mode_value = (bins_phi_edges[mode_bin] + bins_phi_edges[mode_bin + 1]) / 2
+    median_value = np.median(phi_final)
+
+    # 添加统计信息框
+    stats_phi = (f"Entries: {len(phi_final):d}\n"
+                f"Mean: {np.mean(phi_final):.1f} rad\n"
+                f"Std Dev: {np.std(phi_final):.1f} rad\n"
+                f"Median: {median_value:.1f} rad\n"
+                f"Mode: {mode_value:.1f} rad")
+
+    
+
+    ax.text(0.5, 0.25, stats_phi, transform=ax.transAxes,
+        fontsize=10,
+        horizontalalignment='center',    # 水平居中
+        verticalalignment='center',      # 垂直居中（相对于 y=0.25）
+        bbox=dict(boxstyle="round,pad=0.3",
+                facecolor="white", edgecolor="black", alpha=0.9))
+    
+    # 标记峰值和中值
+    ax.axvline(mode_value, color='red', linestyle='--', linewidth=1, alpha=0.7)
+    ax.axvline(median_value, color='orange', linestyle=':', linewidth=1, alpha=0.7)
+
+    plt.tight_layout()
+    plt.show()
+
+    # ================================
+    # 绘制 theta 直方图（线性Y轴）
+    # ================================
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    bins_theta = np.linspace(0, 90, 45)  # 45个边界产生44个bin
+    counts_theta, bins_theta_edges, patches = ax.hist(theta_final, bins=bins_theta, histtype='step', color='purple', linewidth=1.5)
+
+    # 标题和标签
+    ax.set_title('Zenith Angle (θ) Distribution', fontsize=14, fontweight='bold')
+    ax.set_xlabel('θ (radians)', fontsize=12)
+    ax.set_ylabel('Entries', fontsize=12)
+
+    # 计算峰值和中值
+    mode_bin = np.argmax(counts_theta)
+    mode_value = (bins_theta_edges[mode_bin] + bins_theta_edges[mode_bin + 1]) / 2
+    median_value = np.median(theta_final)
+
+    # 添加统计信息框
+    stats_theta = (f"Entries: {len(theta_final):d}\n"
+                f"Mean: {np.mean(theta_final):.2f} rad\n"
+                f"Std Dev: {np.std(theta_final):.2f} rad\n"
+                f"Median: {median_value:.2f} rad\n"
+                f"Mode: {mode_value:.2f} rad\n")
+
+    ax.text(0.98, 0.98, stats_theta, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', horizontalalignment='right',
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="black"))
+
+    # 标记峰值和中值
+    ax.axvline(mode_value, color='red', linestyle='--', linewidth=1, alpha=0.7)
+    ax.axvline(median_value, color='orange', linestyle=':', linewidth=1, alpha=0.7)
+
+    plt.tight_layout()
+    plt.show()
+
+    # ================================
+    # 3. muon径迹长度分布
+    # ================================
+    fig, ax = plt.subplots(figsize=(10, 6))
+    # 自动确定合适的bins
+    if len( length_final) > 0:
+        min_length = max(0, np.min(length_final) - 50)
+        max_length = np.max(length_final) + 50
+        n_bins = min(50, max(20, len(length_final) // 100))  # 根据数据量确定bin数
+        bins_length = np.linspace(min_length, max_length, n_bins)
+    else:
+        bins_length = np.linspace(300, 1000, 50)
+
+    counts_length, bins_length_edges, patches = ax.hist(length_final, bins=bins_length, 
+                                                    histtype='step', color='darkblue', 
+                                                    linewidth=2, edgecolor='navy')
+
+    ax.set_title('Muon Path Length Distribution', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Path Length (cm)', fontsize=12)
+    ax.set_ylabel('Entries', fontsize=12)
+
+    # 计算峰值和中值
+    if len(counts_length) > 0:
+        mode_bin = np.argmax(counts_length)
+        mode_value = (bins_length_edges[mode_bin] + bins_length_edges[mode_bin + 1]) / 2
+    else:
+        mode_value = np.nan
+
+    median_value = np.median(length_final) if len(length_final) > 0 else np.nan
+
+    # 添加统计信息框
+    stats_length = (f"Entries: {len(length_final):d}\n"
+                    f"Mean: {np.mean(length_final):.2f} cm\n"
+                    f"Std Dev: {np.std(length_final):.2f} cm\n"
+                    f"Median: {median_value:.2f} cm\n"
+                    f"Mode: {mode_value:.2f} cm\n"
+                    f"Min: {np.min(length_final):.1f} cm\n"
+                    f"Max: {np.max(length_final):.1f} cm")
+
+    ax.text(0.98, 0.98, stats_length, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', horizontalalignment='right',
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="black"))
+
+    # 标记峰值和中值（如果数据有效）
+    if not np.isnan(mode_value):
+        ax.axvline(mode_value, color='red', linestyle='--', linewidth=1.5, alpha=0.8, label=f'Mode: {mode_value:.1f} m')
+    if not np.isnan(median_value):
+        ax.axvline(median_value, color='orange', linestyle=':', linewidth=1.5, alpha=0.8, label=f'Median: {median_value:.1f} m')
+
+    # 添加图例（如果有有效数据）
+    if not (np.isnan(mode_value) and np.isnan(median_value)):
+        ax.legend(loc='upper left', fontsize=9)
+
+    # 添加网格线
+    ax.grid(True, alpha=0.3, linestyle='--')
+
+    plt.tight_layout()
+    plt.show()
+
+    # 穿过山体后的能量与theta或径迹长度的二维分布图
+    fig, axs = plt.subplots(1, 2, figsize=(15, 6))
+
+    # 第一个子图：能量与theta
+    im1 = axs[0].hist2d(theta_final, emu_final, bins=50, cmap="plasma", alpha=0.8)
+    axs[0].set_xlabel(r"Zenith Angle $\theta$ (°)", fontsize=12, fontweight='bold')
+    axs[0].set_ylabel("Energy (GeV)", fontsize=12, fontweight='bold')
+    axs[0].set_title("Energy vs. Zenith Angle", fontsize=14, fontweight='bold')
+    axs[0].grid(True, alpha=0.3)
+    plt.colorbar(im1[3], ax=axs[0], label='Counts')
+
+    # 第二个子图：能量与径迹长度
+    im2 = axs[1].hist2d(length_final, emu_final, bins=50, cmap="viridis", alpha=0.8)
+    axs[1].set_xlabel("Track Length (cm)", fontsize=12, fontweight='bold')
+    axs[1].set_ylabel("Energy (GeV)", fontsize=12, fontweight='bold')
+    axs[1].set_title("Energy vs. Track Length", fontsize=14, fontweight='bold')
+    axs[1].grid(True, alpha=0.3)
+    plt.colorbar(im2[3], ax=axs[1], label='Counts')
+
+
+
+    plt.tight_layout()
+    plt.show()
+    
+
+
+    
