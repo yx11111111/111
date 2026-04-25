@@ -1,0 +1,126 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+import matplotlib as mpl
+import sys
+
+# --- Try to set a Chinese-capable font to avoid missing-glyph warnings ---
+candidates = [
+    'Noto Sans CJK SC',
+    'Noto Sans CJK',
+    'SimHei',
+    'WenQuanYi Zen Hei',
+    'Microsoft YaHei',
+]
+installed_names = {f.name for f in fm.fontManager.ttflist}
+chosen = None
+for name in candidates:
+    if name in installed_names:
+        chosen = name
+        break
+
+if chosen:
+    mpl.rcParams['font.family'] = chosen
+    mpl.rcParams['axes.unicode_minus'] = False
+    print(f"Using font: {chosen}")
+else:
+    print("No common Chinese font found. To remove missing-glyph warnings, install one of:\n"
+          "  - fonts-noto-cjk (Debian/Ubuntu: sudo apt install fonts-noto-cjk)\n"
+          "  - fonts-noto-cjk-sc / fonts-wqy-zenhei / ttf-mscorefonts-installer (or system equivalent)\n"
+          "Or set a font manually. Continuing with default fonts (warnings may appear).", file=sys.stderr)
+
+# === 1. Load data ===
+# Use absolute paths so running from any cwd works
+file1 = "/home/yangxin/music-python/yangxin1/method/solid_5万.npz"
+file2 = "/home/yangxin/music-python/yangxin1/method/caves_5万.npz"
+
+data1 = np.load(file1)
+data2 = np.load(file2)
+
+
+
+
+# Extract arrays (assumed units: emu=GeV, theta/phi=degrees, length_ls=m)
+emu1, emu2 = data1['emu_final'], data2['emu_final']
+theta1, theta2 = data1['theta_final'], data2['theta_final']
+phi1, phi2 = data1['phi_final'], data2['phi_final']
+length1, length2 = data1['length_final'], data2['length_final']
+
+# Optional: flatten arrays if they are stored as multi-dimensional
+# emu1 = emu1.flatten(); emu2 = emu2.flatten()
+# ... and so on
+
+# === 2. 创建 2x2 子图 ===
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle('level_ground (0,0,-300) vs shape difference center(0,0,-50)+level_ground ', fontsize=16, fontweight='bold')
+
+# Colors and English legend labels
+color1 = 'darkblue'   # level ground
+color2 = 'crimson'    # Cavity + level ground
+color3 = 'orange'     # Cavity + level ground
+color4 = 'green'      # Cavity + level ground
+color5 = 'purple'     # Cavity + level ground
+labels = ['level_ground(0,0,-300)', 'level_ground+rectangular_cavitysize=(100,100,100)', 'level_ground+cylindrical_cavity(h=100,r=50)', 'level_ground+spherical_cavity_r=50']
+
+# ==============================
+# (0,0): emu — energy distribution
+# ==============================
+bins_emu = np.linspace(0, 7500, 150)
+axes[0, 0].hist(emu1, bins=bins_emu, histtype='step', color=color1, linewidth=1.5, label=labels[0])
+axes[0, 0].hist(emu2, bins=bins_emu, histtype='step', color=color2, linewidth=1.5, label=labels[1])
+axes[0, 0].set_yscale('log')
+axes[0, 0].set_title('Energy (emu)', fontweight='semibold')
+axes[0, 0].set_xlabel('Energy (GeV)')
+axes[0, 0].set_ylabel('count')
+axes[0, 0].legend()
+axes[0, 0].grid(True, linestyle='--', alpha=0.5)
+
+# ==============================
+# (0,1): theta — zenith angle distribution
+# ==============================
+bins_theta = np.linspace(0, 120, 121)  # 1-degree bins
+axes[0, 1].hist(theta1, bins=bins_theta, histtype='step', color=color1, linewidth=1.5, label=labels[0])
+axes[0, 1].hist(theta2, bins=bins_theta, histtype='step', color=color2, linewidth=1.5, label=labels[1])
+axes[0, 1].set_title('Zenith Angle (θ)', fontweight='semibold')
+axes[0, 1].set_xlabel('θ (degrees)')
+axes[0, 1].set_ylabel('count')
+axes[0, 1].set_xlim(0, 120)
+axes[0, 1].legend()
+axes[0, 1].grid(True, linestyle='--', alpha=0.5)
+
+# ==============================
+# (1,0): phi — azimuthal angle distribution
+# ==============================
+bins_phi = np.linspace(0, 360, 73)  # 5-degree bins
+axes[1, 0].hist(phi1, bins=bins_phi, histtype='step', color=color1, linewidth=1.5, label=labels[0])
+axes[1, 0].hist(phi2, bins=bins_phi, histtype='step', color=color2, linewidth=1.5, label=labels[1])
+axes[1, 0].set_title('Azimuthal Angle (φ)', fontweight='semibold')
+axes[1, 0].set_xlabel('φ (degrees)')
+axes[1, 0].set_ylabel('count')
+axes[1, 0].set_xlim(0, 360)
+axes[1, 0].legend()
+axes[1, 0].grid(True, linestyle='--', alpha=0.5)
+
+# ==============================
+# (1,1): length_ls — path length distribution
+# ==============================
+all_lengths = np.concatenate([length1, length2])
+if len(all_lengths) > 0:
+    min_len = max(0, np.min(all_lengths) - 50)
+    max_len = np.max(all_lengths) + 50
+    n_bins = min(50, max(20, len(all_lengths) // 100))
+    bins_length = np.linspace(min_len, max_len, n_bins)
+else:
+    bins_length = np.linspace(300, 1000, 50)
+
+axes[1, 1].hist(length1, bins=bins_length, histtype='step', color=color1, linewidth=1.5, label=labels[0])
+axes[1, 1].hist(length2, bins=bins_length, histtype='step', color=color2, linewidth=1.5, label=labels[1])
+axes[1, 1].set_title('Path Length', fontweight='semibold')
+axes[1, 1].set_xlabel('Length (m)')
+axes[1, 1].set_ylabel('count')
+axes[1, 1].legend()
+axes[1, 1].grid(True, linestyle='--', alpha=0.5)
+
+# Adjust layout
+plt.tight_layout(rect=[0, 0, 1, 0.96])  # leave space for suptitle
+plt.show()
